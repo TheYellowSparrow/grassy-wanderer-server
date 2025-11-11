@@ -1,10 +1,22 @@
 // server.js
+'use strict';
+
 const http = require('http');
 const WebSocket = require('ws');
 
 const PORT = process.env.PORT || 3000;
-const PING_INTERVAL_MS = 30000; // 30s
-const STALE_CLIENT_MS = 120000; // 2 minutes
+const PING_INTERVAL_MS = 30_000;      // 30s
+const STALE_CLIENT_MS = 120_000;      // 2 minutes
+const CLEANUP_INTERVAL_MS = 60_000;   // 1 minute
+
+// Limits and rate-limits
+const MAX_MESSAGE_SIZE = 64 * 1024;   // 64 KB per WS message
+const MAX_NAME_LEN = 64;
+const MAX_ROOM_LEN = 64;
+const MAX_AVATAR_LEN = 1024;
+const MAX_CHAT_LEN = 500;
+const MIN_CHAT_INTERVAL_MS = 300;     // per-client chat throttle
+const MIN_POS_INTERVAL_MS = 30;       // per-client pos throttle
 
 // Simple HTTP server for health checks
 const server = http.createServer((req, res) => {
@@ -13,18 +25,39 @@ const server = http.createServer((req, res) => {
 });
 
 // Attach WebSocket server to the HTTP server
-const wss = new WebSocket.Server({ server });
+const wss = new WebSocket.Server({ server, maxPayload: MAX_MESSAGE_SIZE });
 
 // In-memory state
-const clients = new Map(); // id -> { ws, name, avatar, room, x, y, size, color, lastPong, lastUpdate, lastChatAt }
-const rooms = new Map();   // room -> Set of ids
+// clients: id -> { ws, name, avatar, room, x, y, size, color, lastPong, lastUpdate, lastChatAt, lastPosAt }
+const clients = new Map();
+const rooms = new Map(); // room -> Set of ids
 
 function makeId() {
   return Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
 }
 
-function safeString(v, fallback = '') {
-  return (typeof v === 'string' && v.length > 0) ? v : fallback;
+function safeString(v, fallback = '', maxLen = 256) {
+  if (typeof v !== 'string') return fallback;
+  const s = v.trim();
+  if (s.length === 0) return fallback;
+  return s.length > maxLen ? s.slice(0, maxLen) : s;
+}
+
+function cleanupClient(id) {
+  const client = clients.get(id);
+  if (!client) return;
+  const room = client.room;
+  if (room && rooms.has(room)) {
+    rooms.get(room).delete(id);
+    // notify remaining players
+    try {
+      broadcastToRoom(room, { type: 'playerLeft', id });
+    } catch (e) {
+      // swallow - broadcastToRoom already logs
+    }
+    if (rooms.get(room).size === 0) rooms.delete(room);
+  }
+  clients.delete(id);
 }
 
 function broadcastToRoom(room, payload, exceptId = null) {
@@ -39,14 +72,17 @@ function broadcastToRoom(room, payload, exceptId = null) {
       set.delete(id);
       continue;
     }
-    if (c.ws && c.ws.readyState === WebSocket.OPEN) {
-      try {
-        c.ws.send(str);
-      } catch (err) {
-        console.warn('Failed to send to', id, err);
-      }
-    } else {
-      // cleanup dead socket
+    const ws = c.ws;
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      set.delete(id);
+      clients.delete(id);
+      continue;
+    }
+    try {
+      ws.send(str);
+    } catch (err) {
+      console.warn('Failed to send to', id, err && err.message);
+      try { ws.terminate(); } catch (e) {}
       set.delete(id);
       clients.delete(id);
     }
@@ -72,14 +108,26 @@ function sendPlayersListTo(ws, room) {
     }
   }
   try {
-    ws.send(JSON.stringify({ type: 'players', players }));
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: 'players', players }));
+    }
   } catch (e) {
-    console.warn('Failed to send players list', e);
+    console.warn('Failed to send players list', e && e.message);
+  }
+}
+
+function safeParseJson(raw) {
+  try {
+    return JSON.parse(raw);
+  } catch (e) {
+    return null;
   }
 }
 
 wss.on('connection', (ws, req) => {
   const id = makeId();
+  const now = Date.now();
+
   // default client record
   clients.set(id, {
     ws,
@@ -90,9 +138,10 @@ wss.on('connection', (ws, req) => {
     y: 0,
     size: 60,
     color: '#e74c3c',
-    lastPong: Date.now(),
-    lastUpdate: Date.now(),
-    lastChatAt: 0
+    lastPong: now,
+    lastUpdate: now,
+    lastChatAt: 0,
+    lastPosAt: 0
   });
 
   ws.isAlive = true;
@@ -106,128 +155,157 @@ wss.on('connection', (ws, req) => {
   try {
     ws.send(JSON.stringify({ type: 'id', id }));
   } catch (e) {
-    console.warn('Failed to send id to client', id, e);
+    console.warn('Failed to send id to client', id, e && e.message);
   }
 
-  console.log('connected', id, req.socket.remoteAddress);
+  console.log('connected', id, req.socket && req.socket.remoteAddress);
 
   ws.on('message', (raw) => {
-    let msg;
+    // protect against very large messages (ws library also enforces maxPayload)
     try {
-      msg = JSON.parse(raw);
-    } catch (e) {
-      console.warn('Invalid JSON from', id, raw);
-      return;
-    }
-
-    const client = clients.get(id);
-    if (!client) return;
-
-    // JOIN: client announces name/avatar/room/initial pos
-    if (msg.type === 'join') {
-      // Use server id; ignore client-sent id to avoid collisions
-      client.name = safeString(msg.name, 'Player-' + id.slice(-4));
-      client.avatar = safeString(msg.avatar, null);
-      client.room = safeString(msg.room, 'lobby');
-      if (typeof msg.x === 'number') client.x = msg.x;
-      if (typeof msg.y === 'number') client.y = msg.y;
-      if (typeof msg.size === 'number') client.size = msg.size;
-      if (typeof msg.color === 'string') client.color = msg.color;
-      client.lastUpdate = Date.now();
-
-      if (!rooms.has(client.room)) rooms.set(client.room, new Set());
-      rooms.get(client.room).add(id);
-
-      // send full players list to the new client (with positions & avatars)
-      sendPlayersListTo(ws, client.room);
-
-      // notify others in the room about the new player (include avatar & pos)
-      broadcastToRoom(client.room, {
-        type: 'playerJoined',
-        player: {
-          id,
-          name: client.name,
-          avatar: client.avatar || null,
-          x: client.x,
-          y: client.y,
-          size: client.size,
-          color: client.color
-        }
-      }, id);
-
-      console.log('join', id, client.name, 'room=', client.room);
-      return;
-    }
-
-    // POS: position update
-    if (msg.type === 'pos') {
-      // update server-side state (do not trust client id)
-      if (typeof msg.x === 'number') client.x = msg.x;
-      if (typeof msg.y === 'number') client.y = msg.y;
-      if (typeof msg.size === 'number') client.size = msg.size;
-      if (typeof msg.color === 'string') client.color = msg.color;
-      // allow clients to update avatar (optional)
-      if (typeof msg.avatar === 'string' && msg.avatar.length > 0) client.avatar = msg.avatar;
-      client.lastUpdate = Date.now();
-
-      if (client.room) {
-        broadcastToRoom(client.room, {
-          type: 'pos',
-          id,
-          x: client.x,
-          y: client.y,
-          size: client.size,
-          color: client.color,
-          avatar: client.avatar || null,
-          name: client.name
-        }, id);
-      }
-      return;
-    }
-
-    // CHAT: broadcast chat messages to the room
-    if (msg.type === 'chat') {
-      const now = Date.now();
-      // basic rate limiting: one message per 300ms per client
-      const MIN_CHAT_INTERVAL = 300;
-      if (now - (client.lastChatAt || 0) < MIN_CHAT_INTERVAL) {
-        // ignore too-frequent messages
+      if (!raw) return;
+      let text = raw;
+      if (Buffer.isBuffer(raw)) text = raw.toString('utf8');
+      if (typeof text !== 'string') return;
+      if (text.length > MAX_MESSAGE_SIZE) {
+        // ignore oversized messages
+        console.warn('Oversized message from', id);
         return;
       }
-      client.lastChatAt = now;
 
-      const text = (typeof msg.text === 'string') ? msg.text.trim() : '';
-      if (!text) return;
-      // limit length
-      const MAX_CHAT_LEN = 500;
-      const safeText = text.length > MAX_CHAT_LEN ? text.slice(0, MAX_CHAT_LEN) : text;
-      const name = safeString(msg.name || client.name, 'Player-' + id.slice(-4));
-
-      const payload = {
-        type: 'chat',
-        id,
-        name,
-        text: safeText
-      };
-
-      if (client.room) {
-        broadcastToRoom(client.room, payload);
-      } else {
-        // if not in a room yet, echo back to sender only
-        try { ws.send(JSON.stringify(payload)); } catch (e) { /* ignore */ }
+      const msg = safeParseJson(text);
+      if (!msg || typeof msg.type !== 'string') {
+        // ignore malformed messages
+        return;
       }
 
-      console.log('chat', id, name, safeText);
-      return;
-    }
+      const client = clients.get(id);
+      if (!client) return;
 
-    // LEAVE: client requests to leave
-    if (msg.type === 'leave') {
-      try { ws.close(); } catch (e) { /* ignore */ }
-      return;
-    }
+      const now = Date.now();
 
-    // Additional message types (ping, etc.) can be handled here
+      // handle message types safely
+      switch (msg.type) {
+        case 'join': {
+          // validate and apply
+          client.name = safeString(msg.name, 'Player-' + id.slice(-4), MAX_NAME_LEN);
+          client.avatar = safeString(msg.avatar, null, MAX_AVATAR_LEN);
+          client.room = safeString(msg.room, 'lobby', MAX_ROOM_LEN);
+          if (typeof msg.x === 'number') client.x = msg.x;
+          if (typeof msg.y === 'number') client.y = msg.y;
+          if (typeof msg.size === 'number') client.size = msg.size;
+          if (typeof msg.color === 'string') client.color = safeString(msg.color, client.color, 32);
+          client.lastUpdate = now;
+
+          if (!rooms.has(client.room)) rooms.set(client.room, new Set());
+          rooms.get(client.room).add(id);
+
+          // send full players list to the new client
+          sendPlayersListTo(ws, client.room);
+
+          // notify others in the room about the new player
+          broadcastToRoom(client.room, {
+            type: 'playerJoined',
+            player: {
+              id,
+              name: client.name,
+              avatar: client.avatar || null,
+              x: client.x,
+              y: client.y,
+              size: client.size,
+              color: client.color
+            }
+          }, id);
+
+          console.log('join', id, client.name, 'room=', client.room);
+          break;
+        }
+
+        case 'pos': {
+          // throttle frequent pos updates
+          if (now - (client.lastPosAt || 0) < MIN_POS_INTERVAL_MS) {
+            // ignore too-frequent pos updates
+            return;
+          }
+          client.lastPosAt = now;
+
+          if (typeof msg.x === 'number') client.x = msg.x;
+          if (typeof msg.y === 'number') client.y = msg.y;
+          if (typeof msg.size === 'number') client.size = msg.size;
+          if (typeof msg.color === 'string') client.color = safeString(msg.color, client.color, 32);
+          if (typeof msg.avatar === 'string' && msg.avatar.length > 0) client.avatar = safeString(msg.avatar, client.avatar, MAX_AVATAR_LEN);
+          client.lastUpdate = now;
+
+          if (client.room) {
+            broadcastToRoom(client.room, {
+              type: 'pos',
+              id,
+              x: client.x,
+              y: client.y,
+              size: client.size,
+              color: client.color,
+              avatar: client.avatar || null,
+              name: client.name
+            }, id);
+          }
+          break;
+        }
+
+        case 'chat': {
+          // basic rate limiting
+          if (now - (client.lastChatAt || 0) < MIN_CHAT_INTERVAL_MS) {
+            return;
+          }
+          client.lastChatAt = now;
+
+          const rawText = typeof msg.text === 'string' ? msg.text : '';
+          const text = rawText.trim();
+          if (!text) return;
+
+          const safeText = text.length > MAX_CHAT_LEN ? text.slice(0, MAX_CHAT_LEN) : text;
+          const name = safeString(msg.name || client.name, 'Player-' + id.slice(-4), MAX_NAME_LEN);
+
+          const payload = {
+            type: 'chat',
+            id,
+            name,
+            text: safeText
+          };
+
+          if (client.room) {
+            broadcastToRoom(client.room, payload);
+          } else {
+            // if not in a room, echo back to sender
+            try {
+              if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(payload));
+            } catch (e) {
+              console.warn('Failed to echo chat to', id, e && e.message);
+            }
+          }
+
+          console.log('chat', id, name, safeText);
+          break;
+        }
+
+        case 'leave': {
+          try { ws.close(); } catch (e) { /* ignore */ }
+          break;
+        }
+
+        default:
+          // unknown message type - ignore
+          break;
+      }
+    } catch (err) {
+      // protect server from unexpected errors in message handling
+      console.warn('Error handling message from', id, err && err.message);
+      try {
+        // attempt to notify client of error (non-fatal)
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ type: 'error', message: 'Invalid message or server error' }));
+        }
+      } catch (e) { /* ignore */ }
+    }
   });
 
   ws.on('close', () => {
@@ -270,7 +348,7 @@ const pingInterval = setInterval(() => {
       ws.isAlive = false;
       ws.ping();
     } catch (e) {
-      console.warn('ping failed for', id, e);
+      console.warn('ping failed for', id, e && e.message);
     }
   }
 }, PING_INTERVAL_MS);
@@ -280,8 +358,9 @@ const cleanupInterval = setInterval(() => {
   for (const [room, set] of Array.from(rooms.entries())) {
     if (!set || set.size === 0) rooms.delete(room);
   }
-}, 60000);
+}, CLEANUP_INTERVAL_MS);
 
+// Start server
 server.listen(PORT, () => {
   console.log(`✅ WebSocket relay running on ws://localhost:${PORT}`);
 });
@@ -290,12 +369,25 @@ server.listen(PORT, () => {
 function shutdown() {
   clearInterval(pingInterval);
   clearInterval(cleanupInterval);
-  wss.close(() => {
+  try { wss.close(); } catch (e) {}
+  try {
     server.close(() => {
       console.log('Server shut down');
       process.exit(0);
     });
-  });
+  } catch (e) {
+    console.log('Shutdown error', e && e.message);
+    process.exit(1);
+  }
 }
 process.on('SIGINT', shutdown);
 process.on('SIGTERM', shutdown);
+
+// global error handlers to avoid process exit on unexpected errors
+process.on('uncaughtException', (err) => {
+  console.error('uncaughtException', err && err.stack || err);
+  // do not exit immediately; allow graceful shutdown if needed
+});
+process.on('unhandledRejection', (reason) => {
+  console.error('unhandledRejection', reason);
+});
