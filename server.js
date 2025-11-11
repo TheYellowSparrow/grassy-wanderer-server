@@ -1,9 +1,17 @@
-// server.js
+const http = require('http');
 const WebSocket = require('ws');
 
 // Use environment port if hosted, or default to 3000
 const PORT = process.env.PORT || 3000;
-const wss = new WebSocket.Server({ port: PORT });
+
+// Create HTTP server for health check
+const server = http.createServer((req, res) => {
+  res.writeHead(200);
+  res.end('WebSocket server is running');
+});
+
+// Attach WebSocket server to HTTP server
+const wss = new WebSocket.Server({ server });
 
 const clients = new Map();
 
@@ -28,5 +36,7 @@ wss.on('connection', (ws) => {
   });
 });
 
-console.log(`✅ WebSocket relay running on ws://localhost:${PORT}`);
- 
+// Start listening
+server.listen(PORT, () => {
+  console.log(`✅ WebSocket relay running on ws://localhost:${PORT}`);
+});
