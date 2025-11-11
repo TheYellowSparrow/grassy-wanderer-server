@@ -5,32 +5,27 @@ const http = require('http');
 const WebSocket = require('ws');
 
 const PORT = process.env.PORT || 3000;
-const PING_INTERVAL_MS = 30_000;      // 30s
-const STALE_CLIENT_MS = 120_000;      // 2 minutes
-const CLEANUP_INTERVAL_MS = 60_000;   // 1 minute
+const PING_INTERVAL_MS = 30_000;
+const STALE_CLIENT_MS = 120_000;
+const CLEANUP_INTERVAL_MS = 60_000;
 
-// Limits and rate-limits
-const MAX_MESSAGE_SIZE = 64 * 1024;   // 64 KB per WS message
+const MAX_MESSAGE_SIZE = 64 * 1024;
 const MAX_NAME_LEN = 64;
 const MAX_ROOM_LEN = 64;
 const MAX_AVATAR_LEN = 1024;
 const MAX_CHAT_LEN = 500;
-const MIN_CHAT_INTERVAL_MS = 300;     // per-client chat throttle
-const MIN_POS_INTERVAL_MS = 30;       // per-client pos throttle
+const MIN_CHAT_INTERVAL_MS = 300;
+const MIN_POS_INTERVAL_MS = 30;
 
-// Simple HTTP server for health checks
 const server = http.createServer((req, res) => {
   res.writeHead(200, { 'Content-Type': 'text/plain' });
   res.end('WebSocket server is running');
 });
 
-// Attach WebSocket server to the HTTP server
 const wss = new WebSocket.Server({ server, maxPayload: MAX_MESSAGE_SIZE });
 
-// In-memory state
-// clients: id -> { ws, name, avatar, room, x, y, size, color, lastPong, lastUpdate, lastChatAt, lastPosAt }
 const clients = new Map();
-const rooms = new Map(); // room -> Set of ids
+const rooms = new Map();
 
 function makeId() {
   return Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
@@ -43,28 +38,10 @@ function safeString(v, fallback = '', maxLen = 256) {
   return s.length > maxLen ? s.slice(0, maxLen) : s;
 }
 
-function cleanupClient(id) {
-  const client = clients.get(id);
-  if (!client) return;
-  const room = client.room;
-  if (room && rooms.has(room)) {
-    rooms.get(room).delete(id);
-    // notify remaining players
-    try {
-      broadcastToRoom(room, { type: 'playerLeft', id });
-    } catch (e) {
-      // swallow - broadcastToRoom already logs
-    }
-    if (rooms.get(room).size === 0) rooms.delete(room);
-  }
-  clients.delete(id);
-}
-
 function broadcastToRoom(room, payload, exceptId = null) {
   const set = rooms.get(room);
   if (!set) return;
   const str = JSON.stringify(payload);
-  // iterate over a snapshot to avoid mutation issues
   for (const id of Array.from(set)) {
     if (id === exceptId) continue;
     const c = clients.get(id);
@@ -117,18 +94,13 @@ function sendPlayersListTo(ws, room) {
 }
 
 function safeParseJson(raw) {
-  try {
-    return JSON.parse(raw);
-  } catch (e) {
-    return null;
-  }
+  try { return JSON.parse(raw); } catch (e) { return null; }
 }
 
 wss.on('connection', (ws, req) => {
   const id = makeId();
   const now = Date.now();
 
-  // default client record
   clients.set(id, {
     ws,
     name: null,
@@ -151,43 +123,31 @@ wss.on('connection', (ws, req) => {
     ws.isAlive = true;
   });
 
-  // send server-assigned id immediately
-  try {
-    ws.send(JSON.stringify({ type: 'id', id }));
-  } catch (e) {
-    console.warn('Failed to send id to client', id, e && e.message);
-  }
+  try { ws.send(JSON.stringify({ type: 'id', id })); } catch (e) { console.warn('Failed to send id to client', id, e && e.message); }
 
   console.log('connected', id, req.socket && req.socket.remoteAddress);
 
   ws.on('message', (raw) => {
-    // protect against very large messages (ws library also enforces maxPayload)
     try {
       if (!raw) return;
       let text = raw;
       if (Buffer.isBuffer(raw)) text = raw.toString('utf8');
       if (typeof text !== 'string') return;
       if (text.length > MAX_MESSAGE_SIZE) {
-        // ignore oversized messages
         console.warn('Oversized message from', id);
         return;
       }
 
       const msg = safeParseJson(text);
-      if (!msg || typeof msg.type !== 'string') {
-        // ignore malformed messages
-        return;
-      }
+      if (!msg || typeof msg.type !== 'string') return;
 
       const client = clients.get(id);
       if (!client) return;
 
       const now = Date.now();
 
-      // handle message types safely
       switch (msg.type) {
         case 'join': {
-          // validate and apply
           client.name = safeString(msg.name, 'Player-' + id.slice(-4), MAX_NAME_LEN);
           client.avatar = safeString(msg.avatar, null, MAX_AVATAR_LEN);
           client.room = safeString(msg.room, 'lobby', MAX_ROOM_LEN);
@@ -200,10 +160,8 @@ wss.on('connection', (ws, req) => {
           if (!rooms.has(client.room)) rooms.set(client.room, new Set());
           rooms.get(client.room).add(id);
 
-          // send full players list to the new client
           sendPlayersListTo(ws, client.room);
 
-          // notify others in the room about the new player
           broadcastToRoom(client.room, {
             type: 'playerJoined',
             player: {
@@ -217,16 +175,21 @@ wss.on('connection', (ws, req) => {
             }
           }, id);
 
+          // IMPORTANT: send explicit joined ack so client knows server processed the join
+          try {
+            if (ws.readyState === WebSocket.OPEN) {
+              ws.send(JSON.stringify({ type: 'joined', room: client.room }));
+            }
+          } catch (e) {
+            console.warn('Failed to send joined ack to', id, e && e.message);
+          }
+
           console.log('join', id, client.name, 'room=', client.room);
           break;
         }
 
         case 'pos': {
-          // throttle frequent pos updates
-          if (now - (client.lastPosAt || 0) < MIN_POS_INTERVAL_MS) {
-            // ignore too-frequent pos updates
-            return;
-          }
+          if (now - (client.lastPosAt || 0) < MIN_POS_INTERVAL_MS) return;
           client.lastPosAt = now;
 
           if (typeof msg.x === 'number') client.x = msg.x;
@@ -252,10 +215,7 @@ wss.on('connection', (ws, req) => {
         }
 
         case 'chat': {
-          // basic rate limiting
-          if (now - (client.lastChatAt || 0) < MIN_CHAT_INTERVAL_MS) {
-            return;
-          }
+          if (now - (client.lastChatAt || 0) < MIN_CHAT_INTERVAL_MS) return;
           client.lastChatAt = now;
 
           const rawText = typeof msg.text === 'string' ? msg.text : '';
@@ -265,22 +225,12 @@ wss.on('connection', (ws, req) => {
           const safeText = text.length > MAX_CHAT_LEN ? text.slice(0, MAX_CHAT_LEN) : text;
           const name = safeString(msg.name || client.name, 'Player-' + id.slice(-4), MAX_NAME_LEN);
 
-          const payload = {
-            type: 'chat',
-            id,
-            name,
-            text: safeText
-          };
+          const payload = { type: 'chat', id, name, text: safeText };
 
           if (client.room) {
             broadcastToRoom(client.room, payload);
           } else {
-            // if not in a room, echo back to sender
-            try {
-              if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(payload));
-            } catch (e) {
-              console.warn('Failed to echo chat to', id, e && e.message);
-            }
+            try { if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(payload)); } catch (e) {}
           }
 
           console.log('chat', id, name, safeText);
@@ -288,23 +238,16 @@ wss.on('connection', (ws, req) => {
         }
 
         case 'leave': {
-          try { ws.close(); } catch (e) { /* ignore */ }
+          try { ws.close(); } catch (e) {}
           break;
         }
 
         default:
-          // unknown message type - ignore
           break;
       }
     } catch (err) {
-      // protect server from unexpected errors in message handling
       console.warn('Error handling message from', id, err && err.message);
-      try {
-        // attempt to notify client of error (non-fatal)
-        if (ws && ws.readyState === WebSocket.OPEN) {
-          ws.send(JSON.stringify({ type: 'error', message: 'Invalid message or server error' }));
-        }
-      } catch (e) { /* ignore */ }
+      try { if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'error', message: 'Invalid message or server error' })); } catch (e) {}
     }
   });
 
@@ -314,7 +257,6 @@ wss.on('connection', (ws, req) => {
     const room = client.room;
     if (room && rooms.has(room)) {
       rooms.get(room).delete(id);
-      // notify remaining players
       broadcastToRoom(room, { type: 'playerLeft', id });
       if (rooms.get(room).size === 0) rooms.delete(room);
     }
@@ -327,45 +269,30 @@ wss.on('connection', (ws, req) => {
   });
 });
 
-// Ping/pong keepalive and stale cleanup
 const pingInterval = setInterval(() => {
   const now = Date.now();
   for (const [id, c] of Array.from(clients.entries())) {
     const ws = c.ws;
-    if (!ws) {
-      clients.delete(id);
-      continue;
-    }
-    // if last pong is too old, terminate
+    if (!ws) { clients.delete(id); continue; }
     if (now - (c.lastPong || 0) > STALE_CLIENT_MS) {
       console.log('terminating stale client', id);
-      try { ws.terminate(); } catch (e) { /* ignore */ }
-      // cleanup will happen in 'close' handler
+      try { ws.terminate(); } catch (e) {}
       continue;
     }
-    // send ping
-    try {
-      ws.isAlive = false;
-      ws.ping();
-    } catch (e) {
-      console.warn('ping failed for', id, e && e.message);
-    }
+    try { ws.isAlive = false; ws.ping(); } catch (e) { console.warn('ping failed for', id, e && e.message); }
   }
 }, PING_INTERVAL_MS);
 
-// Optional periodic cleanup of empty rooms (defensive)
 const cleanupInterval = setInterval(() => {
   for (const [room, set] of Array.from(rooms.entries())) {
     if (!set || set.size === 0) rooms.delete(room);
   }
 }, CLEANUP_INTERVAL_MS);
 
-// Start server
 server.listen(PORT, () => {
   console.log(`✅ WebSocket relay running on ws://localhost:${PORT}`);
 });
 
-// graceful shutdown
 function shutdown() {
   clearInterval(pingInterval);
   clearInterval(cleanupInterval);
@@ -383,10 +310,8 @@ function shutdown() {
 process.on('SIGINT', shutdown);
 process.on('SIGTERM', shutdown);
 
-// global error handlers to avoid process exit on unexpected errors
 process.on('uncaughtException', (err) => {
   console.error('uncaughtException', err && err.stack || err);
-  // do not exit immediately; allow graceful shutdown if needed
 });
 process.on('unhandledRejection', (reason) => {
   console.error('unhandledRejection', reason);
