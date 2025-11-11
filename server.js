@@ -16,7 +16,7 @@ const server = http.createServer((req, res) => {
 const wss = new WebSocket.Server({ server });
 
 // In-memory state
-const clients = new Map(); // id -> { ws, name, avatar, room, x, y, size, color, lastPong, lastUpdate }
+const clients = new Map(); // id -> { ws, name, avatar, room, x, y, size, color, lastPong, lastUpdate, lastChatAt }
 const rooms = new Map();   // room -> Set of ids
 
 function makeId() {
@@ -91,7 +91,8 @@ wss.on('connection', (ws, req) => {
     size: 60,
     color: '#e74c3c',
     lastPong: Date.now(),
-    lastUpdate: Date.now()
+    lastUpdate: Date.now(),
+    lastChatAt: 0
   });
 
   ws.isAlive = true;
@@ -184,13 +185,49 @@ wss.on('connection', (ws, req) => {
       return;
     }
 
+    // CHAT: broadcast chat messages to the room
+    if (msg.type === 'chat') {
+      const now = Date.now();
+      // basic rate limiting: one message per 300ms per client
+      const MIN_CHAT_INTERVAL = 300;
+      if (now - (client.lastChatAt || 0) < MIN_CHAT_INTERVAL) {
+        // ignore too-frequent messages
+        return;
+      }
+      client.lastChatAt = now;
+
+      const text = (typeof msg.text === 'string') ? msg.text.trim() : '';
+      if (!text) return;
+      // limit length
+      const MAX_CHAT_LEN = 500;
+      const safeText = text.length > MAX_CHAT_LEN ? text.slice(0, MAX_CHAT_LEN) : text;
+      const name = safeString(msg.name || client.name, 'Player-' + id.slice(-4));
+
+      const payload = {
+        type: 'chat',
+        id,
+        name,
+        text: safeText
+      };
+
+      if (client.room) {
+        broadcastToRoom(client.room, payload);
+      } else {
+        // if not in a room yet, echo back to sender only
+        try { ws.send(JSON.stringify(payload)); } catch (e) { /* ignore */ }
+      }
+
+      console.log('chat', id, name, safeText);
+      return;
+    }
+
     // LEAVE: client requests to leave
     if (msg.type === 'leave') {
       try { ws.close(); } catch (e) { /* ignore */ }
       return;
     }
 
-    // Additional message types (chat, ping, etc.) can be handled here
+    // Additional message types (ping, etc.) can be handled here
   });
 
   ws.on('close', () => {
