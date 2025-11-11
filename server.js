@@ -31,6 +31,10 @@ function makeId() {
   return Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
 }
 
+function makeMid() {
+  return Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+}
+
 function safeString(v, fallback = '', maxLen = 256) {
   if (typeof v !== 'string') return fallback;
   const s = v.trim();
@@ -175,7 +179,7 @@ wss.on('connection', (ws, req) => {
             }
           }, id);
 
-          // IMPORTANT: send explicit joined ack so client knows server processed the join
+          // joined ack
           try {
             if (ws.readyState === WebSocket.OPEN) {
               ws.send(JSON.stringify({ type: 'joined', room: client.room }));
@@ -225,7 +229,9 @@ wss.on('connection', (ws, req) => {
           const safeText = text.length > MAX_CHAT_LEN ? text.slice(0, MAX_CHAT_LEN) : text;
           const name = safeString(msg.name || client.name, 'Player-' + id.slice(-4), MAX_NAME_LEN);
 
-          const payload = { type: 'chat', id, name, text: safeText };
+          // generate unique message id for dedupe on clients
+          const mid = makeMid();
+          const payload = { type: 'chat', id, name, text: safeText, mid };
 
           if (client.room) {
             broadcastToRoom(client.room, payload);
@@ -233,7 +239,7 @@ wss.on('connection', (ws, req) => {
             try { if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(payload)); } catch (e) {}
           }
 
-          console.log('chat', id, name, safeText);
+          console.log('chat', id, name, safeText, 'mid=' + mid);
           break;
         }
 
