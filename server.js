@@ -3,39 +3,96 @@ const http = require('http');
 const WebSocket = require('ws');
 
 const PORT = process.env.PORT || 3000;
+const PING_INTERVAL_MS = 30000; // 30s
+const STALE_CLIENT_MS = 120000; // 2 minutes
+
+// Simple HTTP server for health checks
 const server = http.createServer((req, res) => {
-  res.writeHead(200);
+  res.writeHead(200, { 'Content-Type': 'text/plain' });
   res.end('WebSocket server is running');
 });
+
+// Attach WebSocket server to the HTTP server
 const wss = new WebSocket.Server({ server });
 
-const clients = new Map(); // id -> { ws, name, room, x, y, size, color, lastPong }
+// In-memory state
+const clients = new Map(); // id -> { ws, name, avatar, room, x, y, size, color, lastPong, lastUpdate }
 const rooms = new Map();   // room -> Set of ids
 
 function makeId() {
   return Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
 }
 
+function safeString(v, fallback = '') {
+  return (typeof v === 'string' && v.length > 0) ? v : fallback;
+}
+
 function broadcastToRoom(room, payload, exceptId = null) {
   const set = rooms.get(room);
   if (!set) return;
   const str = JSON.stringify(payload);
+  // iterate over a snapshot to avoid mutation issues
   for (const id of Array.from(set)) {
     if (id === exceptId) continue;
     const c = clients.get(id);
-    if (!c) { set.delete(id); continue; }
-    if (c.ws.readyState === WebSocket.OPEN) {
-      try { c.ws.send(str); } catch (e) { console.warn('send error', id, e); }
+    if (!c) {
+      set.delete(id);
+      continue;
+    }
+    if (c.ws && c.ws.readyState === WebSocket.OPEN) {
+      try {
+        c.ws.send(str);
+      } catch (err) {
+        console.warn('Failed to send to', id, err);
+      }
     } else {
+      // cleanup dead socket
       set.delete(id);
       clients.delete(id);
     }
   }
 }
 
-wss.on('connection', (ws) => {
+function sendPlayersListTo(ws, room) {
+  const set = rooms.get(room);
+  const players = [];
+  if (set) {
+    for (const id of set) {
+      const c = clients.get(id);
+      if (!c) continue;
+      players.push({
+        id,
+        name: c.name,
+        avatar: c.avatar || null,
+        x: typeof c.x === 'number' ? c.x : 0,
+        y: typeof c.y === 'number' ? c.y : 0,
+        size: c.size || 60,
+        color: c.color || '#e74c3c'
+      });
+    }
+  }
+  try {
+    ws.send(JSON.stringify({ type: 'players', players }));
+  } catch (e) {
+    console.warn('Failed to send players list', e);
+  }
+}
+
+wss.on('connection', (ws, req) => {
   const id = makeId();
-  clients.set(id, { ws, name: null, room: null, x: 0, y: 0, size: 60, color: '#e74c3c', lastPong: Date.now() });
+  // default client record
+  clients.set(id, {
+    ws,
+    name: null,
+    avatar: null,
+    room: null,
+    x: 0,
+    y: 0,
+    size: 60,
+    color: '#e74c3c',
+    lastPong: Date.now(),
+    lastUpdate: Date.now()
+  });
 
   ws.isAlive = true;
   ws.on('pong', () => {
@@ -44,59 +101,96 @@ wss.on('connection', (ws) => {
     ws.isAlive = true;
   });
 
-  // Tell client its server-assigned id
-  ws.send(JSON.stringify({ type: 'id', id }));
+  // send server-assigned id immediately
+  try {
+    ws.send(JSON.stringify({ type: 'id', id }));
+  } catch (e) {
+    console.warn('Failed to send id to client', id, e);
+  }
+
+  console.log('connected', id, req.socket.remoteAddress);
 
   ws.on('message', (raw) => {
     let msg;
-    try { msg = JSON.parse(raw); } catch (e) { console.warn('invalid json', raw); return; }
+    try {
+      msg = JSON.parse(raw);
+    } catch (e) {
+      console.warn('Invalid JSON from', id, raw);
+      return;
+    }
 
+    const client = clients.get(id);
+    if (!client) return;
+
+    // JOIN: client announces name/avatar/room/initial pos
     if (msg.type === 'join') {
-      // Ignore client-sent id; use server id
-      const client = clients.get(id);
-      client.name = msg.name || ('P-' + id.slice(-4));
-      client.room = msg.room || 'lobby';
+      // Use server id; ignore client-sent id to avoid collisions
+      client.name = safeString(msg.name, 'Player-' + id.slice(-4));
+      client.avatar = safeString(msg.avatar, null);
+      client.room = safeString(msg.room, 'lobby');
       if (typeof msg.x === 'number') client.x = msg.x;
       if (typeof msg.y === 'number') client.y = msg.y;
-      if (msg.size) client.size = msg.size;
-      if (msg.color) client.color = msg.color;
+      if (typeof msg.size === 'number') client.size = msg.size;
+      if (typeof msg.color === 'string') client.color = msg.color;
+      client.lastUpdate = Date.now();
 
       if (!rooms.has(client.room)) rooms.set(client.room, new Set());
       rooms.get(client.room).add(id);
 
-      // Send full players list (with positions) to the new client
-      const players = Array.from(rooms.get(client.room)).map(i => {
-        const c = clients.get(i);
-        return { id: i, name: c.name, x: c.x, y: c.y, size: c.size, color: c.color };
-      });
-      ws.send(JSON.stringify({ type: 'players', players }));
+      // send full players list to the new client (with positions & avatars)
+      sendPlayersListTo(ws, client.room);
 
-      // Notify others in the room
-      broadcastToRoom(client.room, { type: 'playerJoined', player: { id, name: client.name, x: client.x, y: client.y, size: client.size, color: client.color } }, id);
+      // notify others in the room about the new player (include avatar & pos)
+      broadcastToRoom(client.room, {
+        type: 'playerJoined',
+        player: {
+          id,
+          name: client.name,
+          avatar: client.avatar || null,
+          x: client.x,
+          y: client.y,
+          size: client.size,
+          color: client.color
+        }
+      }, id);
 
-      console.log('join', id, client.name, client.room);
+      console.log('join', id, client.name, 'room=', client.room);
       return;
     }
 
+    // POS: position update
     if (msg.type === 'pos') {
-      const client = clients.get(id);
-      if (!client) return;
-      client.x = (typeof msg.x === 'number') ? msg.x : client.x;
-      client.y = (typeof msg.y === 'number') ? msg.y : client.y;
-      client.size = msg.size || client.size;
-      client.color = msg.color || client.color;
-      client.last = Date.now();
+      // update server-side state (do not trust client id)
+      if (typeof msg.x === 'number') client.x = msg.x;
+      if (typeof msg.y === 'number') client.y = msg.y;
+      if (typeof msg.size === 'number') client.size = msg.size;
+      if (typeof msg.color === 'string') client.color = msg.color;
+      // allow clients to update avatar (optional)
+      if (typeof msg.avatar === 'string' && msg.avatar.length > 0) client.avatar = msg.avatar;
+      client.lastUpdate = Date.now();
 
       if (client.room) {
-        broadcastToRoom(client.room, { type: 'pos', id, x: client.x, y: client.y, size: client.size, color: client.color }, id);
+        broadcastToRoom(client.room, {
+          type: 'pos',
+          id,
+          x: client.x,
+          y: client.y,
+          size: client.size,
+          color: client.color,
+          avatar: client.avatar || null,
+          name: client.name
+        }, id);
       }
       return;
     }
 
+    // LEAVE: client requests to leave
     if (msg.type === 'leave') {
-      ws.close();
+      try { ws.close(); } catch (e) { /* ignore */ }
       return;
     }
+
+    // Additional message types (chat, ping, etc.) can be handled here
   });
 
   ws.on('close', () => {
@@ -105,21 +199,66 @@ wss.on('connection', (ws) => {
     const room = client.room;
     if (room && rooms.has(room)) {
       rooms.get(room).delete(id);
+      // notify remaining players
       broadcastToRoom(room, { type: 'playerLeft', id });
       if (rooms.get(room).size === 0) rooms.delete(room);
     }
     clients.delete(id);
-    console.log('disconnect', id);
+    console.log('disconnect', id, client.name);
+  });
+
+  ws.on('error', (err) => {
+    console.warn('ws error', id, err && err.message);
   });
 });
 
-// Ping/pong keepalive
-const interval = setInterval(() => {
-  wss.clients.forEach((ws) => {
-    if (ws.isAlive === false) return ws.terminate();
-    ws.isAlive = false;
-    try { ws.ping(); } catch (e) { /* ignore */ }
-  });
-}, 30000);
+// Ping/pong keepalive and stale cleanup
+const pingInterval = setInterval(() => {
+  const now = Date.now();
+  for (const [id, c] of Array.from(clients.entries())) {
+    const ws = c.ws;
+    if (!ws) {
+      clients.delete(id);
+      continue;
+    }
+    // if last pong is too old, terminate
+    if (now - (c.lastPong || 0) > STALE_CLIENT_MS) {
+      console.log('terminating stale client', id);
+      try { ws.terminate(); } catch (e) { /* ignore */ }
+      // cleanup will happen in 'close' handler
+      continue;
+    }
+    // send ping
+    try {
+      ws.isAlive = false;
+      ws.ping();
+    } catch (e) {
+      console.warn('ping failed for', id, e);
+    }
+  }
+}, PING_INTERVAL_MS);
 
-server.listen(PORT, () => console.log(`Listening on ${PORT}`));
+// Optional periodic cleanup of empty rooms (defensive)
+const cleanupInterval = setInterval(() => {
+  for (const [room, set] of Array.from(rooms.entries())) {
+    if (!set || set.size === 0) rooms.delete(room);
+  }
+}, 60000);
+
+server.listen(PORT, () => {
+  console.log(`✅ WebSocket relay running on ws://localhost:${PORT}`);
+});
+
+// graceful shutdown
+function shutdown() {
+  clearInterval(pingInterval);
+  clearInterval(cleanupInterval);
+  wss.close(() => {
+    server.close(() => {
+      console.log('Server shut down');
+      process.exit(0);
+    });
+  });
+}
+process.on('SIGINT', shutdown);
+process.on('SIGTERM', shutdown);
